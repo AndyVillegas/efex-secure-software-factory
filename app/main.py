@@ -4,7 +4,6 @@ from contextlib import asynccontextmanager
 import sqlite3
 import os
 
-EFEX_API_SECRET = "efex-prod-secret-123"
 DATABASE_URL = "sqlite:///tmp/efex.db"
 
 class PaymentRequest(BaseModel):
@@ -12,14 +11,14 @@ class PaymentRequest(BaseModel):
     destination_clabe: str
     amount: float
     concept: str
-    
+
 def get_connection():
     return sqlite3.connect("/tmp/efex.db")
 
 def init_db():
     conn = get_connection()
     cursor = conn.cursor()
-    
+
     cursor.execute(
         """
         CREATE TABLE IF NOT EXISTS customers (
@@ -31,9 +30,9 @@ def init_db():
         )
         """
     )
-    
+
     cursor.execute("DELETE FROM customers")
-    
+
     cursor.executemany(
         """
         INSERT INTO customers (name, email, clabe, kyc_status)
@@ -54,31 +53,29 @@ async def lifespan(app: FastAPI):
     init_db()
     yield
 
-app = FastAPI(
-    lifespan=lifespan
-)
+app = FastAPI(lifespan=lifespan)
 
 @app.get("/health")
 def health():
     return {
         "status": "ok",
-        "service": "efex-vulnerable",
-        "version": "0.1.0-red"
+        "service": "efex-remediated",
+        "version": "0.2.0-green"
     }
-    
+
 @app.get("/customers/search")
 def search_customer(email: str = Query(..., description="Customer email to search")):
     conn = get_connection()
     cursor = conn.cursor()
 
-    query = f"SELECT id, name, email, clabe, kyc_status FROM customers WHERE email = '{email}'"
-
-    cursor.execute(query)
+    cursor.execute(
+        "SELECT id, name, email, clabe, kyc_status FROM customers WHERE email = ?",
+        (email,)
+    )
     rows = cursor.fetchall()
     conn.close()
 
     return {
-        "query_executed": query,
         "results": [
             {
                 "id": row[0],
@@ -103,13 +100,4 @@ def create_payment(payment: PaymentRequest):
         "destination_clabe": payment.destination_clabe,
         "amount": payment.amount,
         "concept": payment.concept,
-    }
-
-
-@app.get("/debug/config")
-def debug_config():
-    return {
-        "api_secret": EFEX_API_SECRET,
-        "database_url": DATABASE_URL,
-        "environment": os.getenv("ENVIRONMENT", "local-red"),
     }

@@ -114,7 +114,7 @@ jobs:
         if: github.ref_name == 'remediated-demo'
         id: push
         run: |
-          IMAGE=ghcr.io/${{ github.repository_owner }}/efex-demo
+          IMAGE=ghcr.io/$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')/efex-demo
           docker tag $IMAGE_NAME:ci $IMAGE:${{ github.sha }}
           docker push $IMAGE:${{ github.sha }}
           DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "$IMAGE:${{ github.sha }}")
