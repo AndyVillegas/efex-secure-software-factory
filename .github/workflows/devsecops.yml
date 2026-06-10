@@ -1,0 +1,228 @@
+name: Secure Software Factory
+
+on:
+  push:
+    branches:
+      - main
+      - vulnerable-demo
+      - remediated-demo
+  pull_request:
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+  packages: write
+  id-token: write
+
+jobs:
+  devsecops:
+    name: DevSecOps Multi-Layer Pipeline
+    runs-on: ubuntu-latest
+
+    env:
+      IMAGE_NAME: efex-vuln
+      TERRAFORM_DIR: terraform
+      AWS_ACCESS_KEY_ID: dummy-access-key
+      AWS_SECRET_ACCESS_KEY: dummy-secret-key
+      AWS_DEFAULT_REGION: us-east-1
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r app/requirements.txt
+
+      - name: Run unit tests
+        run: |
+          pytest app/tests
+
+      - name: Run Gitleaks secret scan
+        id: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run Semgrep SAST
+        id: semgrep
+        continue-on-error: true
+        run: |
+          pipx install semgrep --quiet 2>&1 | tail -1
+          semgrep scan --config=p/default --error .
+
+      - name: Run Checkov IaC scan
+        id: checkov
+        continue-on-error: true
+        run: |
+          pip install checkov --quiet
+          set +e
+          checkov -d "$TERRAFORM_DIR" \
+            --framework terraform \
+            --output cli \
+            --output sarif \
+            --output-file-path .
+          CHECKOV_EXIT=$?
+          mv results_sarif.sarif checkov.sarif 2>/dev/null || true
+          exit $CHECKOV_EXIT
+
+      - name: Build Docker image
+        run: |
+          docker build -t $IMAGE_NAME:ci .
+
+      - name: Run Trivy filesystem scan
+        id: trivy_fs
+        uses: aquasecurity/trivy-action@v0.24.0
+        continue-on-error: true
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          format: table
+          exit-code: 1
+
+      - name: Run Trivy container scan
+        id: trivy_image
+        uses: aquasecurity/trivy-action@v0.24.0
+        continue-on-error: true
+        with:
+          image-ref: ${{ env.IMAGE_NAME }}:ci
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          format: table
+          exit-code: 1
+
+      - name: Log in to GHCR
+        if: github.ref_name == 'remediated-demo'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push image to GHCR
+        if: github.ref_name == 'remediated-demo'
+        id: push
+        run: |
+          IMAGE=ghcr.io/${{ github.repository_owner }}/efex-demo
+          docker tag $IMAGE_NAME:ci $IMAGE:${{ github.sha }}
+          docker push $IMAGE:${{ github.sha }}
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "$IMAGE:${{ github.sha }}")
+          echo "ref=$DIGEST" >> $GITHUB_OUTPUT
+
+      - name: Install cosign
+        if: github.ref_name == 'remediated-demo'
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign image with cosign (keyless)
+        if: github.ref_name == 'remediated-demo'
+        run: |
+          cosign sign --yes ${{ steps.push.outputs.ref }}
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.15.5
+
+      - name: Terraform init
+        run: |
+          terraform -chdir=${{ env.TERRAFORM_DIR }} init
+
+      - name: Terraform plan JSON
+        run: |
+          terraform -chdir=${{ env.TERRAFORM_DIR }} plan -refresh=false -out=tfplan
+          terraform -chdir=${{ env.TERRAFORM_DIR }} show -json tfplan > tfplan.json
+
+      - name: Install Conftest
+        run: |
+          wget https://github.com/open-policy-agent/conftest/releases/download/v0.56.0/conftest_0.56.0_Linux_x86_64.tar.gz
+          tar xzf conftest_0.56.0_Linux_x86_64.tar.gz
+          sudo mv conftest /usr/local/bin
+          conftest --version
+
+      - name: Run Conftest Terraform policies
+        id: conftest_terraform
+        continue-on-error: true
+        run: |
+          conftest test tfplan.json -p policies/terraform --namespace terraform.security
+
+      - name: Run Conftest Dockerfile policies
+        id: conftest_docker
+        continue-on-error: true
+        run: |
+          conftest test Dockerfile -p policies/docker --parser dockerfile --namespace docker.security
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.IMAGE_NAME }}:ci
+          format: cyclonedx-json
+          output-file: sbom.cdx.json
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-cyclonedx
+          path: sbom.cdx.json
+
+      - name: Upload Terraform plan JSON artifact
+        if: always() && hashFiles('tfplan.json') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-plan-json
+          path: tfplan.json
+
+      - name: Upload Checkov SARIF artifact
+        if: always() && hashFiles('checkov.sarif') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: checkov-sarif
+          path: checkov.sarif
+
+      - name: Final security gate result
+        if: always()
+        env:
+          GITLEAKS_OUTCOME: ${{ steps.gitleaks.outcome }}
+          SEMGREP_OUTCOME: ${{ steps.semgrep.outcome }}
+          CHECKOV_OUTCOME: ${{ steps.checkov.outcome }}
+          TRIVY_FS_OUTCOME: ${{ steps.trivy_fs.outcome }}
+          TRIVY_IMAGE_OUTCOME: ${{ steps.trivy_image.outcome }}
+          CONFTEST_TERRAFORM_OUTCOME: ${{ steps.conftest_terraform.outcome }}
+          CONFTEST_DOCKER_OUTCOME: ${{ steps.conftest_docker.outcome }}
+        run: |
+          echo "Security gate summary:"
+          echo "Gitleaks: $GITLEAKS_OUTCOME"
+          echo "Semgrep: $SEMGREP_OUTCOME"
+          echo "Checkov: $CHECKOV_OUTCOME"
+          echo "Trivy FS: $TRIVY_FS_OUTCOME"
+          echo "Trivy Image: $TRIVY_IMAGE_OUTCOME"
+          echo "Conftest Terraform: $CONFTEST_TERRAFORM_OUTCOME"
+          echo "Conftest Dockerfile: $CONFTEST_DOCKER_OUTCOME"
+
+          if [ "$GITHUB_REF_NAME" = "vulnerable-demo" ]; then
+            echo "Vulnerable baseline detected. This branch is expected to fail until remediation is applied."
+            exit 1
+          fi
+
+          if [ "$GITLEAKS_OUTCOME" = "failure" ] || \
+             [ "$SEMGREP_OUTCOME" = "failure" ] || \
+             [ "$CHECKOV_OUTCOME" = "failure" ] || \
+             [ "$TRIVY_FS_OUTCOME" = "failure" ] || \
+             [ "$TRIVY_IMAGE_OUTCOME" = "failure" ] || \
+             [ "$CONFTEST_TERRAFORM_OUTCOME" = "failure" ] || \
+             [ "$CONFTEST_DOCKER_OUTCOME" = "failure" ]; then
+            echo "One or more security gates failed."
+            exit 1
+          fi
+
+          echo "All security gates passed."
